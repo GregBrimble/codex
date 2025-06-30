@@ -50,6 +50,10 @@ pub struct ModelProviderInfo {
 
     /// Optional query parameters to append to the base URL.
     pub query_params: Option<HashMap<String, String>>,
+
+    /// Optional custom headers to include in API requests.
+    /// Environment variables in values (format: ${VAR_NAME}) will be substituted.
+    pub custom_headers: Option<HashMap<String, String>>,
 }
 
 impl ModelProviderInfo {
@@ -103,6 +107,56 @@ impl ModelProviderInfo {
             None => Ok(None),
         }
     }
+
+    /// Returns processed custom headers with environment variable substitution.
+    /// Headers come from both the provider config and the CODEX_CUSTOM_HEADERS env var.
+    /// Environment variables in values (format: ${VAR_NAME}) are replaced with their values.
+    pub fn get_custom_headers(&self) -> HashMap<String, String> {
+        let mut headers = HashMap::new();
+        
+        // Add headers from provider config
+        if let Some(provider_headers) = &self.custom_headers {
+            for (key, value) in provider_headers {
+                let processed_value = self.substitute_env_vars(value);
+                headers.insert(key.clone(), processed_value);
+            }
+        }
+        
+        // Add headers from CODEX_CUSTOM_HEADERS environment variable
+        if let Ok(env_headers) = std::env::var("CODEX_CUSTOM_HEADERS") {
+            for line in env_headers.lines() {
+                if let Some((key, value)) = line.split_once(':') {
+                    let key = key.trim().to_string();
+                    let value = value.trim().to_string();
+                    let processed_value = self.substitute_env_vars(&value);
+                    headers.insert(key, processed_value);
+                }
+            }
+        }
+        
+        headers
+    }
+
+    /// Substitute environment variables in a string (format: ${VAR_NAME}).
+    fn substitute_env_vars(&self, input: &str) -> String {
+        let mut result = input.to_string();
+        
+        // Find all ${VAR_NAME} patterns and replace them
+        while let Some(start) = result.find("${") {
+            if let Some(end) = result[start + 2..].find('}') {
+                let var_name = &result[start + 2..start + 2 + end];
+                let replacement = std::env::var(var_name).unwrap_or_else(|_| {
+                    tracing::warn!("Environment variable '{}' not found in custom header", var_name);
+                    String::new()
+                });
+                result.replace_range(start..start + 3 + end, &replacement);
+            } else {
+                break;
+            }
+        }
+        
+        result
+    }
 }
 
 /// Built-in default provider list.
@@ -123,6 +177,7 @@ pub fn built_in_model_providers() -> HashMap<String, ModelProviderInfo> {
                 env_key_instructions: Some("Create an API key (https://platform.openai.com) and export it as an environment variable.".into()),
                 wire_api: WireApi::Responses,
                 query_params: None,
+                custom_headers: None,
             },
         ),
     ]
@@ -149,6 +204,7 @@ base_url = "http://localhost:11434/v1"
             env_key_instructions: None,
             wire_api: WireApi::Chat,
             query_params: None,
+            custom_headers: None,
         };
 
         let provider: ModelProviderInfo = toml::from_str(azure_provider_toml).unwrap();
@@ -172,9 +228,98 @@ query_params = { api-version = "2025-04-01-preview" }
             query_params: Some(maplit::hashmap! {
                 "api-version".to_string() => "2025-04-01-preview".to_string(),
             }),
+            custom_headers: None,
         };
 
         let provider: ModelProviderInfo = toml::from_str(azure_provider_toml).unwrap();
+        assert_eq!(expected_provider, provider);
+    }
+
+    #[test]
+    fn test_custom_headers_env_substitution() {
+        // Set up environment variable for testing
+        std::env::set_var("TEST_HEADER_VALUE", "test-value-123");
+        
+        let provider = ModelProviderInfo {
+            name: "Test Provider".into(),
+            base_url: "https://api.example.com".into(),
+            env_key: None,
+            env_key_instructions: None,
+            wire_api: WireApi::Chat,
+            query_params: None,
+            custom_headers: Some(maplit::hashmap! {
+                "X-Custom-Header".to_string() => "static-value".to_string(),
+                "X-Dynamic-Header".to_string() => "${TEST_HEADER_VALUE}".to_string(),
+                "X-Mixed-Header".to_string() => "prefix-${TEST_HEADER_VALUE}-suffix".to_string(),
+            }),
+        };
+
+        let headers = provider.get_custom_headers();
+        
+        assert_eq!(headers.get("X-Custom-Header"), Some(&"static-value".to_string()));
+        assert_eq!(headers.get("X-Dynamic-Header"), Some(&"test-value-123".to_string()));
+        assert_eq!(headers.get("X-Mixed-Header"), Some(&"prefix-test-value-123-suffix".to_string()));
+        
+        // Clean up
+        std::env::remove_var("TEST_HEADER_VALUE");
+    }
+
+    #[test]
+    fn test_codex_custom_headers_env_var() {
+        // Set up environment variables for testing
+        std::env::set_var("TEST_TOKEN", "secret-token-456");
+        std::env::set_var("CODEX_CUSTOM_HEADERS", "X-Custom-Auth: Bearer ${TEST_TOKEN}\nX-App-Version: 2.0.0\nX-Extra: some value");
+        
+        let provider = ModelProviderInfo {
+            name: "Test Provider".into(),
+            base_url: "https://api.example.com".into(),
+            env_key: None,
+            env_key_instructions: None,
+            wire_api: WireApi::Chat,
+            query_params: None,
+            custom_headers: Some(maplit::hashmap! {
+                "X-Provider-Header".to_string() => "provider-value".to_string(),
+            }),
+        };
+
+        let headers = provider.get_custom_headers();
+        
+        // Headers from provider config should be present
+        assert_eq!(headers.get("X-Provider-Header"), Some(&"provider-value".to_string()));
+        
+        // Headers from CODEX_CUSTOM_HEADERS should be present with env var substitution
+        assert_eq!(headers.get("X-Custom-Auth"), Some(&"Bearer secret-token-456".to_string()));
+        assert_eq!(headers.get("X-App-Version"), Some(&"2.0.0".to_string()));
+        assert_eq!(headers.get("X-Extra"), Some(&"some value".to_string()));
+        
+        // Clean up
+        std::env::remove_var("TEST_TOKEN");
+        std::env::remove_var("CODEX_CUSTOM_HEADERS");
+    }
+
+    #[test]
+    fn test_deserialize_custom_headers_toml() {
+        let provider_toml = r#"
+name = "Custom Provider"
+base_url = "https://api.example.com/v1"
+env_key = "CUSTOM_API_KEY"
+custom_headers = { "X-Custom-Auth" = "${CUSTOM_TOKEN}", "X-App-Version" = "1.0.0" }
+        "#;
+        
+        let expected_provider = ModelProviderInfo {
+            name: "Custom Provider".into(),
+            base_url: "https://api.example.com/v1".into(),
+            env_key: Some("CUSTOM_API_KEY".into()),
+            env_key_instructions: None,
+            wire_api: WireApi::Chat,
+            query_params: None,
+            custom_headers: Some(maplit::hashmap! {
+                "X-Custom-Auth".to_string() => "${CUSTOM_TOKEN}".to_string(),
+                "X-App-Version".to_string() => "1.0.0".to_string(),
+            }),
+        };
+
+        let provider: ModelProviderInfo = toml::from_str(provider_toml).unwrap();
         assert_eq!(expected_provider, provider);
     }
 }

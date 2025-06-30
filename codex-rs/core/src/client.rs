@@ -136,12 +136,19 @@ impl ModelClient {
                     instructions: None,
                 })
             })?;
-            let res = self
+            let mut req_builder = self
                 .client
                 .post(&url)
                 .bearer_auth(api_key)
                 .header("OpenAI-Beta", "responses=experimental")
-                .header(reqwest::header::ACCEPT, "text/event-stream")
+                .header(reqwest::header::ACCEPT, "text/event-stream");
+
+            // Add custom headers
+            for (key, value) in self.provider.get_custom_headers() {
+                req_builder = req_builder.header(key, value);
+            }
+
+            let res = req_builder
                 .json(&payload)
                 .send()
                 .await;

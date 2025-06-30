@@ -130,8 +130,14 @@ pub(crate) async fn stream_chat_completions(
         if let Some(api_key) = &api_key {
             req_builder = req_builder.bearer_auth(api_key.clone());
         }
+        req_builder = req_builder.header(reqwest::header::ACCEPT, "text/event-stream");
+
+        // Add custom headers
+        for (key, value) in provider.get_custom_headers() {
+            req_builder = req_builder.header(key, value);
+        }
+
         let res = req_builder
-            .header(reqwest::header::ACCEPT, "text/event-stream")
             .json(&payload)
             .send()
             .await;
